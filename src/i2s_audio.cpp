@@ -23,7 +23,8 @@ static uint32_t s_dma_buf[2][DMA_BUF_WORDS];
 static const uint8_t *s_pcm_data   = nullptr;
 static uint32_t       s_pcm_len    = 0;
 static uint32_t       s_pcm_offset = 0;
-static volatile bool  s_playing    = false;
+static volatile bool  s_playing      = false;
+static volatile bool  s_just_finished = false;
 
 // Fill one DMA buffer with the next samples, zero-pad at end of stream
 static void fill_dma_buf(uint32_t *buf, uint32_t words) {
@@ -54,6 +55,7 @@ static void i2s_data_handler(nrfx_i2s_buffers_t const *p_released,
         nrfx_i2s_next_buffers_set(&next);
 
         if (!s_playing) {
+            s_just_finished = true;
             nrfx_i2s_stop();
         }
     }
@@ -100,4 +102,12 @@ void i2s_audio_stop() {
 
 bool i2s_audio_is_playing() {
     return s_playing;
+}
+
+bool i2s_audio_just_finished() {
+    if (s_just_finished) {
+        s_just_finished = false;
+        return true;
+    }
+    return false;
 }

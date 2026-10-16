@@ -13,3 +13,7 @@ void i2s_audio_stop();
 
 // Returns true if playback is currently in progress
 bool i2s_audio_is_playing();
+
+// Returns true exactly once when playback transitions from playing → stopped.
+// Call repeatedly from loop(); resets the flag on first true return.
+bool i2s_audio_just_finished();

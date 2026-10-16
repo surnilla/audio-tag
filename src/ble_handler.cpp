@@ -9,16 +9,19 @@
 #define AUDIO_TAG_SVC_UUID   "12345678-1234-1234-1234-1234567890AB"
 #define AUDIO_DATA_CHAR_UUID "12345678-1234-1234-1234-1234567890AC"  // phone → raw PCM
 #define CLIP_SEL_CHAR_UUID   "12345678-1234-1234-1234-1234567890AD"  // helmet → clip index
+#define STATUS_CHAR_UUID     "12345678-1234-1234-1234-1234567890AE"
 
 BLEService        audioSvc(AUDIO_TAG_SVC_UUID);
 BLECharacteristic audioDataChar(AUDIO_DATA_CHAR_UUID);  // Write, WriteNoRsp
 BLECharacteristic clipSelChar(CLIP_SEL_CHAR_UUID);       // Write
+BLECharacteristic statusChar(STATUS_CHAR_UUID);
 
 // ── Audio data reassembly buffer ───────────────────────────────────────────
 #define AUDIO_BUF_MAX (64 * 1024)  // 64 KB — enough for ~10s of 8-bit/8kHz mono
 static uint8_t  s_audio_buf[AUDIO_BUF_MAX];
-static uint32_t s_audio_len = 0;
-static bool     s_streaming = false;
+static uint32_t s_audio_len    = 0;
+static uint32_t s_expected_len = 0;
+static bool     s_streaming    = false;
 
 // Written by phone: raw PCM packets, multi-packet stream
 // First packet carries a 4-byte little-endian total length header,
@@ -36,8 +39,9 @@ static void on_audio_data_written(uint16_t conn_hdl,
             Serial.printf("BLE: invalid audio length %u\n", total);
             return;
         }
-        s_audio_len  = 0;
-        s_streaming  = true;
+        s_audio_len    = 0;
+        s_expected_len = total;
+        s_streaming    = true;
         data += 4; len -= 4;
         Serial.printf("BLE: audio stream start, expect %u bytes\n", total);
     }
@@ -49,9 +53,14 @@ static void on_audio_data_written(uint16_t conn_hdl,
     memcpy(s_audio_buf + s_audio_len, data, copy);
     s_audio_len += copy;
 
-    // End-of-stream sentinel: zero-length write from phone
-    // (handled below in on_audio_data_written with len==0 after streaming starts)
-    // Alternatively phone can send exact byte count to trigger playback.
+    if (s_audio_len >= s_expected_len && s_expected_len > 0) {
+        i2s_audio_play_raw(s_audio_buf, s_audio_len);
+        uint8_t started = 0x01;
+        statusChar.notify(&started, 1);
+        s_streaming    = false;
+        s_expected_len = 0;
+        Serial.printf("BLE: buffer complete (%u bytes), playback started\n", s_audio_len);
+    }
 }
 
 // Written by helmet tag: 1-byte clip index
@@ -70,13 +79,9 @@ static void on_connect(uint16_t conn_hdl) {
 
 static void on_disconnect(uint16_t conn_hdl, uint8_t reason) {
     Serial.printf("BLE: disconnected (reason 0x%02X)\n", reason);
-    // If streaming was in progress, play whatever we buffered
-    if (s_streaming && s_audio_len > 0) {
-        Serial.printf("BLE: playing buffered %u bytes\n", s_audio_len);
-        i2s_audio_play_raw(s_audio_buf, s_audio_len);
-    }
-    s_streaming = false;
-    s_audio_len = 0;
+    s_streaming    = false;
+    s_audio_len    = 0;
+    s_expected_len = 0;
 }
 
 void ble_handler_init() {
@@ -99,6 +104,11 @@ void ble_handler_init() {
     clipSelChar.setWriteCallback(on_clip_sel_written);
     clipSelChar.begin();
 
+    statusChar.setProperties(CHR_PROPS_NOTIFY);
+    statusChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+    statusChar.setFixedLen(1);
+    statusChar.begin();
+
     // Start advertising
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
     Bluefruit.Advertising.addTxPower();
@@ -111,6 +121,9 @@ void ble_handler_init() {
 }
 
 void ble_handler_update() {
-    // Placeholder for any polling-based BLE logic
-    // Bluefruit callbacks are interrupt-driven; nothing needed here yet
+    if (i2s_audio_just_finished()) {
+        uint8_t done = 0x02;
+        statusChar.notify(&done, 1);
+        Serial.println("BLE: notified DONE");
+    }
 }
