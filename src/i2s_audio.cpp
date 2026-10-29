@@ -62,9 +62,11 @@ static void i2s_data_handler(nrfx_i2s_buffers_t const *p_released,
 }
 
 void i2s_audio_init() {
+    // NRFX_I2S_PIN_NOT_USED (0xFF) is the correct sentinel for uint8_t pin fields.
+    // NRF_I2S_PIN_NOT_CONNECTED is 0xFFFFFFFF and causes a narrowing error.
     nrfx_i2s_config_t cfg = NRFX_I2S_DEFAULT_CONFIG(
-        I2S_SCK_PIN, I2S_WS_PIN, NRF_I2S_PIN_NOT_CONNECTED,
-        NRF_I2S_PIN_NOT_CONNECTED, I2S_SDOUT_PIN);
+        I2S_SCK_PIN, I2S_WS_PIN, 0xFF,
+        0xFF, I2S_SDOUT_PIN);
 
     cfg.sample_width = NRF_I2S_SWIDTH_16BIT;
     cfg.channels     = NRF_I2S_CHANNELS_STEREO;  // nRF always outputs stereo frames
