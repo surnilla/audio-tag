@@ -58,5 +58,10 @@ void setup() {
 }
 
 void loop() {
-    echo.play((const uint8_t*)tone_buf, sizeof(tone_buf));
+    static bool played = false;
+    if (!played) {
+        echo.play((const uint8_t*)tone_buf, sizeof(tone_buf));
+        delay(1100);  // wait for DMA buffer to drain (1s of audio + margin)
+        played = true;
+    }
 }
