@@ -298,7 +298,7 @@ void setup() {
 
     // Init Flite BEFORE BLE — BLE consumes heap Flite needs
     g_flite = new Flite();
-    g_flite->setVoice(register_cmu_us_slt());  // slt = female, clearer than kal (male)
+    g_flite->setVoice(register_cmu_us_kal());
 
     pinMode(BTN_PIN, INPUT_PULLUP);
 
