@@ -438,9 +438,23 @@ void loop() {
     if (g_tts_pending) {
         g_tts_pending = false;
         play_notification();
-        g_replay_type = 2;  // text stays in g_tts_buf for replay
+        g_replay_type = 0;
         cst_wave *wave = g_flite ? g_flite->textToWave(g_tts_buf) : nullptr;
         if (wave && wave->num_samples > 0) {
+            // Cache the synthesised samples in PSRAM for instant replay
+            // (avoids re-synthesising on double-tap, which caused a 1-3 s delay).
+            size_t wave_bytes = (size_t)wave->num_samples * sizeof(int16_t);
+            if (g_replay_pcm_buf) { free(g_replay_pcm_buf); }
+            g_replay_pcm_buf = (uint8_t *)heap_caps_malloc(
+                wave_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!g_replay_pcm_buf)
+                g_replay_pcm_buf = (uint8_t *)malloc(wave_bytes);
+            if (g_replay_pcm_buf) {
+                memcpy(g_replay_pcm_buf, wave->samples, wave_bytes);
+                g_replay_pcm_size = wave_bytes;
+                g_replay_type = 2;  // cached TTS PCM — 8 kHz 16-bit mono
+            }
+
             int n = wave->num_samples;
             const int CHUNK = 256;
             int32_t chunk_buf[CHUNK * 4];  // 2× upsampled stereo 32-bit
@@ -466,20 +480,21 @@ void loop() {
     // --- Double-tap replay ---
     if (g_replay_pending) {
         g_replay_pending = false;
-        if (g_replay_type == 1 && g_replay_pcm_buf) {
-            play_mono16((const int16_t *)g_replay_pcm_buf,
-                        g_replay_pcm_size / sizeof(int16_t));
-        } else if (g_replay_type == 2) {
-            cst_wave *wave = g_flite ? g_flite->textToWave(g_tts_buf) : nullptr;
-            if (wave && wave->num_samples > 0) {
-                int n = wave->num_samples;
+        if (g_replay_pcm_buf && g_replay_pcm_size > 0) {
+            int n = (int)(g_replay_pcm_size / sizeof(int16_t));
+            const int16_t *samples = (const int16_t *)g_replay_pcm_buf;
+            if (g_replay_type == 1) {
+                // Phone Voice: 16 kHz mono — play directly
+                play_mono16(samples, n);
+            } else if (g_replay_type == 2) {
+                // Device Voice: cached 8 kHz Flite PCM — 2× upsample to 16 kHz
                 const int CHUNK = 256;
                 int32_t chunk_buf[CHUNK * 4];
                 for (int i = 0; i < n; i += CHUNK) {
                     int cnt = (i + CHUNK < n) ? CHUNK : (n - i);
                     for (int j = 0; j < cnt; j++) {
-                        int16_t s0  = wave->samples[i + j];
-                        int16_t s1  = (i + j + 1 < n) ? wave->samples[i + j + 1] : s0;
+                        int16_t s0  = samples[i + j];
+                        int16_t s1  = (i + j + 1 < n) ? samples[i + j + 1] : s0;
                         int16_t mid = (int16_t)(((int32_t)s0 + s1) / 2);
                         chunk_buf[j*4+0] = (int32_t)s0  << 16;
                         chunk_buf[j*4+1] = (int32_t)s0  << 16;
@@ -488,7 +503,6 @@ void loop() {
                     }
                     echo.play((const uint8_t *)chunk_buf, cnt * 4 * sizeof(int32_t));
                 }
-                delete_wave(wave);
             }
         }
         return;
