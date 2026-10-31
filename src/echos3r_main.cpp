@@ -5,6 +5,7 @@
 #include <BLE2902.h>
 #include <M5EchoBase.h>
 #include <esp_task_wdt.h>
+#include <esp_gap_ble_api.h>
 #include "flite_arduino.h"
 
 #define AMP_ENABLE   18
@@ -222,6 +223,18 @@ void cst_free(void *p) { free(p); }
 // ---------------------------------------------------------------
 
 class ServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer *srv, esp_ble_gatts_cb_param_t *param) override {
+        // Request upgrade to Coded PHY (S8) for extended range (~200 m).
+        // Both sides must agree; if the phone doesn't support Coded PHY the
+        // connection stays on 1M — no harm done.
+        esp_ble_gap_set_prefered_le_phy(
+            param->connect.conn_id,
+            ESP_BLE_GAP_PHY_CODED_PREF_MASK,
+            ESP_BLE_GAP_PHY_CODED_PREF_MASK,
+            ESP_BLE_GAP_PHY_OPTIONS_PREF_S8_CODING
+        );
+    }
+
     void onDisconnect(BLEServer *srv) override {
         g_audio_receiving = false;
         g_audio_pending   = false;
