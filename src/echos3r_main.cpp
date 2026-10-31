@@ -15,7 +15,9 @@
 #define PIN_I2S_DOUT  48
 #define PIN_I2S_BCLK  17
 #define SAMPLE_RATE  16000
-#define BTN_PIN      41   // G41 push-to-talk button (active LOW)
+#define BTN_PIN            41   // G41 push-to-talk button (active LOW)
+#define SHORT_TAP_MS       250  // press ≤ this = short tap (candidate for double-tap)
+#define DOUBLE_TAP_WINDOW  400  // two short taps within this window = replay
 
 // UUIDs matching audio-tag-android app
 #define SVC_UUID   "12345678-1234-1234-1234-1234567890ab"
@@ -62,6 +64,12 @@ static uint32_t  g_rec_bytes = 0;        // bytes recorded so far
 static bool      g_btn_last  = false;    // previous button state
 static volatile bool g_rec_pending = false;
 
+// --- Replay last received message (double-tap G41) ---
+static uint8_t  *g_replay_pcm_buf  = nullptr;  // saved Phone Voice PCM (PSRAM)
+static uint32_t  g_replay_pcm_size = 0;
+static uint8_t   g_replay_type     = 0;  // 0=none 1=PCM 2=TTS
+static volatile bool g_replay_pending = false;
+
 // ---------------------------------------------------------------
 
 static void play_beep(int freq_hz, int duration_ms) {
@@ -83,6 +91,18 @@ static void beeps(int n) {
         play_beep(1000, 400);
         if (i < n - 1) delay(200);
     }
+}
+
+// Attention chime played before an incoming message.
+// Two sharp high notes + a settling tone, then a 3-second pause so the
+// worker is ready before the message begins.
+static void play_notification() {
+    play_beep(1760, 100);   // A6 — sharp attention note
+    delay(80);
+    play_beep(1760, 100);   // repeat
+    delay(80);
+    play_beep(1174, 300);   // D6 — settling tone
+    delay(2500);            // pause → ~3.8 s total from chime start to message
 }
 
 static void notify_byte(uint8_t val) {
@@ -176,24 +196,12 @@ void *cst_safe_alloc(int size) {
     void *p = nullptr;
     if (size >= FLITE_PSRAM_THRESHOLD) {
         p = heap_caps_calloc(1, (size_t)size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!p) {
-            Serial.printf("[cst] PSRAM calloc FAILED sz=%d psram_free=%d\n",
-                size, (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            Serial.flush();
-            p = calloc(1, (size_t)size);
-        }
+        if (!p) p = calloc(1, (size_t)size);
     } else {
         p = calloc(1, (size_t)size);
         if (!p) p = heap_caps_calloc(1, (size_t)size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
-    if (!p) {
-        Serial.printf("[cst] ABORT sz=%d int_free=%d psram_free=%d\n",
-            size,
-            (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-            (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-        Serial.flush();
-        abort();
-    }
+    if (!p) abort();
     return p;
 }
 
@@ -280,10 +288,6 @@ class TtsCallback : public BLECharacteristicCallbacks {
 void setup() {
     delay(500);
     Serial.begin(115200);
-    Serial.printf("[boot] int_free=%d psram_free=%d psram_size=%d\n",
-        (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-        (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-        (int)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
 
     // No heap_caps_malloc_extmem_enable — Flite uses the custom cst_* allocator
     // below (CST_USER_MALLOC) which routes large allocs to PSRAM explicitly.
@@ -329,7 +333,7 @@ void setup() {
                    PIN_I2S_DIN, PIN_I2S_WS, PIN_I2S_DOUT, PIN_I2S_BCLK)) {
         return;
     }
-    echo.setSpeakerVolume(80);
+    echo.setSpeakerVolume(90);
     echo.setMicGain(ES8311_MIC_GAIN_6DB);   // modest boost — 18dB caused clipping
 
     // Allocate recording buffer — try PSRAM first, fall back to heap
@@ -348,29 +352,55 @@ void setup() {
 }
 
 void loop() {
-    // --- PTT button handling ---
+    // --- PTT / double-tap button handling ---
     bool btn_pressed = (digitalRead(BTN_PIN) == LOW);
 
+    // Statics for double-tap detection
+    static uint32_t s_press_start_ms      = 0;
+    static bool     s_short_press_pending = false;
+    static uint32_t s_short_press_time    = 0;
+
     if (btn_pressed && !g_btn_last) {
-        // Button just pressed — start recording.
-        // Note: TX auto_clear=true (ESP-IDF 5 new I2S API default) keeps speaker
-        // outputting silence while we only call record(), so no acoustic feedback.
-        g_rec_bytes = 0;
-        notify_byte(STATUS_RECORDING);
+        s_press_start_ms = millis();
+        if (s_short_press_pending &&
+                (millis() - s_short_press_time < DOUBLE_TAP_WINDOW)) {
+            // Second short tap within window → replay last message
+            s_short_press_pending = false;
+            g_replay_pending = true;
+        } else {
+            // Normal PTT press — start recording
+            s_short_press_pending = false;
+            g_rec_bytes = 0;
+            notify_byte(STATUS_RECORDING);
+        }
     }
 
-    if (btn_pressed && g_rec_buf) {
-        // Button held — record one chunk (160 stereo frames × 4 bytes = 640 DMA bytes = 20ms at 8kHz)
+    if (btn_pressed && g_rec_buf && !g_replay_pending) {
+        // Held — record one chunk (~10 ms at 16 kHz 32-bit stereo)
         record_chunk(REC_CHUNK_BYTES);
     }
 
-    if (!btn_pressed && g_btn_last) {
-        // Button just released — skip beeps (I2S TX crashes after long RX session).
-        // Android app shows status via BLE STATUS notifications.
-        if (g_rec_bytes > 0) {
-            g_rec_pending = true;
+    if (!btn_pressed && g_btn_last && !g_replay_pending) {
+        uint32_t dur = millis() - s_press_start_ms;
+        if (dur < SHORT_TAP_MS) {
+            // Short tap — first of a potential double-tap; discard the tiny recording
+            notify_byte(STATUS_DONE);   // clear phone's "Recording…" state
+            g_rec_bytes = 0;
+            s_short_press_pending = true;
+            s_short_press_time    = millis();
+        } else {
+            // Long press — PTT complete, send audio
+            s_short_press_pending = false;
+            if (g_rec_bytes > 0) g_rec_pending = true;
         }
     }
+
+    // Expire the double-tap window
+    if (s_short_press_pending &&
+            (millis() - s_short_press_time >= DOUBLE_TAP_WINDOW)) {
+        s_short_press_pending = false;
+    }
+
     g_btn_last = btn_pressed;
 
     // --- Send mic audio to phone for STT ---
@@ -383,10 +413,15 @@ void loop() {
     // --- Raw PCM audio from phone → speaker ---
     if (g_audio_pending) {
         g_audio_pending = false;
+        play_notification();
         int n_samples = g_audio_total / sizeof(int16_t);
         play_mono16((const int16_t *)g_audio_buf, n_samples);
-        free(g_audio_buf);
-        g_audio_buf = nullptr;
+        // Save for replay — transfer ownership, don't free yet
+        if (g_replay_pcm_buf) { free(g_replay_pcm_buf); }
+        g_replay_pcm_buf  = g_audio_buf;
+        g_replay_pcm_size = g_audio_total;
+        g_audio_buf       = nullptr;
+        g_replay_type     = 1;
         notify_byte(STATUS_DONE);
         return;
     }
@@ -396,6 +431,8 @@ void loop() {
     // Flite enough stack for multi-word synthesis without overflow.
     if (g_tts_pending) {
         g_tts_pending = false;
+        play_notification();
+        g_replay_type = 2;  // text stays in g_tts_buf for replay
         cst_wave *wave = g_flite ? g_flite->textToWave(g_tts_buf) : nullptr;
         if (wave && wave->num_samples > 0) {
             int n = wave->num_samples;
@@ -417,6 +454,37 @@ void loop() {
             delete_wave(wave);
         }
         notify_byte(STATUS_DONE);
+        return;
+    }
+
+    // --- Double-tap replay ---
+    if (g_replay_pending) {
+        g_replay_pending = false;
+        if (g_replay_type == 1 && g_replay_pcm_buf) {
+            play_mono16((const int16_t *)g_replay_pcm_buf,
+                        g_replay_pcm_size / sizeof(int16_t));
+        } else if (g_replay_type == 2) {
+            cst_wave *wave = g_flite ? g_flite->textToWave(g_tts_buf) : nullptr;
+            if (wave && wave->num_samples > 0) {
+                int n = wave->num_samples;
+                const int CHUNK = 256;
+                int32_t chunk_buf[CHUNK * 4];
+                for (int i = 0; i < n; i += CHUNK) {
+                    int cnt = (i + CHUNK < n) ? CHUNK : (n - i);
+                    for (int j = 0; j < cnt; j++) {
+                        int16_t s0  = wave->samples[i + j];
+                        int16_t s1  = (i + j + 1 < n) ? wave->samples[i + j + 1] : s0;
+                        int16_t mid = (int16_t)(((int32_t)s0 + s1) / 2);
+                        chunk_buf[j*4+0] = (int32_t)s0  << 16;
+                        chunk_buf[j*4+1] = (int32_t)s0  << 16;
+                        chunk_buf[j*4+2] = (int32_t)mid << 16;
+                        chunk_buf[j*4+3] = (int32_t)mid << 16;
+                    }
+                    echo.play((const uint8_t *)chunk_buf, cnt * 4 * sizeof(int32_t));
+                }
+                delete_wave(wave);
+            }
+        }
         return;
     }
 
