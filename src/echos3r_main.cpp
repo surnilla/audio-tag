@@ -4,6 +4,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <M5EchoBase.h>
+#include <esp_task_wdt.h>
 #include "flite_arduino.h"
 
 #define AMP_ENABLE   18
@@ -14,22 +15,39 @@
 #define PIN_I2S_DOUT  48
 #define PIN_I2S_BCLK  17
 #define SAMPLE_RATE  16000
+#define BTN_PIN      41   // G41 push-to-talk button (active LOW)
 
 // UUIDs matching audio-tag-android app
 #define SVC_UUID   "12345678-1234-1234-1234-1234567890ab"
 #define AUDIO_UUID "12345678-1234-1234-1234-1234567890ac"  // write: raw PCM from phone
 #define TTS_UUID   "12345678-1234-1234-1234-1234567890ad"  // write: text → Flite TTS
 #define STA_UUID   "12345678-1234-1234-1234-1234567890ae"  // notify: status
+#define MIC_UUID   "12345678-1234-1234-1234-1234567890af"  // notify: mic PCM → phone STT
+
+// Status byte values
+#define STATUS_RECEIVING  0x01
+#define STATUS_DONE       0x02
+#define STATUS_RECORDING  0x03
+#define STATUS_MIC_SEND   0x04
+
+// Max PTT recording: 10 seconds of 16kHz mono 16-bit = 320 KB
+// Falls back to 5s or 3s if PSRAM unavailable
+#define MAX_REC_BYTES     (SAMPLE_RATE * sizeof(int16_t) * 10)
+#define MAX_REC_BYTES_5S  (SAMPLE_RATE * sizeof(int16_t) * 5)
+#define MAX_REC_BYTES_3S  (SAMPLE_RATE * sizeof(int16_t) * 3)
+// BLE notify payload: conservative 244 bytes — fits within MTU 256 (negotiated
+// by Samsung Galaxy). Requesting MTU 512 doesn't always succeed; if we assume
+// 509 bytes per notification but only 253 are sent, half the audio is lost.
+#define NOTIFY_PAYLOAD 244
 
 static M5EchoBase echo;
 static BLECharacteristic *g_sta_char = nullptr;
+static BLECharacteristic *g_mic_char = nullptr;
 
-// --- Audio (raw PCM) path ---
-// Phone sends: [4-byte LE length header][PCM data chunks...]
-// PCM format: 16kHz mono 16-bit little-endian
-static uint8_t  *g_audio_buf      = nullptr;
-static uint32_t  g_audio_total    = 0;
-static uint32_t  g_audio_received = 0;
+// --- Audio (raw PCM) path: phone → Echo ---
+static uint8_t  *g_audio_buf       = nullptr;
+static uint32_t  g_audio_total     = 0;
+static uint32_t  g_audio_received  = 0;
 static bool      g_audio_receiving = false;
 static volatile bool g_audio_pending = false;
 
@@ -38,15 +56,24 @@ static volatile bool g_tts_pending = false;
 static char          g_tts_buf[256];
 static Flite        *g_flite = nullptr;
 
+// --- PTT mic path: Echo → phone ---
+static uint8_t  *g_rec_buf   = nullptr;  // mono PCM in PSRAM
+static uint32_t  g_rec_bytes = 0;        // bytes recorded so far
+static bool      g_btn_last  = false;    // previous button state
+static volatile bool g_rec_pending = false;
+
 // ---------------------------------------------------------------
 
 static void play_beep(int freq_hz, int duration_ms) {
     int samples = SAMPLE_RATE * duration_ms / 1000;
-    int16_t *buf = (int16_t *)malloc(samples * sizeof(int16_t));
+    int32_t *buf = (int32_t *)malloc(samples * 2 * sizeof(int32_t));  // stereo 32-bit
     if (!buf) return;
-    for (int i = 0; i < samples; i++)
-        buf[i] = (int16_t)(28000.0f * sinf(2.0f * M_PI * freq_hz * i / SAMPLE_RATE));
-    echo.play((const uint8_t *)buf, samples * sizeof(int16_t));
+    for (int i = 0; i < samples; i++) {
+        int32_t s = (int32_t)((int16_t)(28000.0f * sinf(2.0f * M_PI * freq_hz * i / SAMPLE_RATE))) << 16;
+        buf[i*2+0] = s;  // L
+        buf[i*2+1] = s;  // R
+    }
+    echo.play((const uint8_t *)buf, samples * 2 * sizeof(int32_t));
     delay(duration_ms + 200);
     free(buf);
 }
@@ -64,30 +91,133 @@ static void notify_byte(uint8_t val) {
     g_sta_char->notify();
 }
 
-// Play 16kHz mono PCM buffer through M5EchoBase (which is stereo).
-// Converts mono → stereo in 256-sample chunks to avoid large allocations.
+// Play 16kHz mono PCM through M5EchoBase (stereo 32-bit). Chunked to avoid large alloc.
+// I2S is 32-bit wide: shift each 16-bit sample to the MSB of the 32-bit word.
 static void play_mono16(const int16_t *pcm, int n_samples) {
     const int CHUNK = 256;
-    int16_t chunk_buf[CHUNK * 2];  // stereo
+    int32_t chunk_buf[CHUNK * 2];  // stereo 32-bit
     for (int i = 0; i < n_samples; i += CHUNK) {
         int cnt = (i + CHUNK < n_samples) ? CHUNK : (n_samples - i);
         for (int j = 0; j < cnt; j++) {
-            chunk_buf[j*2+0] = pcm[i + j];  // L
-            chunk_buf[j*2+1] = pcm[i + j];  // R
+            int32_t s = (int32_t)pcm[i + j] << 16;
+            chunk_buf[j*2+0] = s;  // L
+            chunk_buf[j*2+1] = s;  // R
         }
-        echo.play((const uint8_t *)chunk_buf, cnt * 2 * sizeof(int16_t));
+        echo.play((const uint8_t *)chunk_buf, cnt * 2 * sizeof(int32_t));
     }
 }
+
+// Record one chunk of stereo audio and convert to mono into g_rec_buf.
+// I2S is 32-bit stereo: each DMA frame = 8 bytes [L:4 bytes, R:4 bytes].
+// ES8311_RESOLUTION_32 sends 24-bit audio MSB-aligned; top 16 bits = signal.
+#define REC_CHUNK_BYTES 1280   // 160 frames × 8 bytes = 10ms at 16kHz 32-bit stereo
+static uint8_t s_stereo_chunk[REC_CHUNK_BYTES];  // static — no VLA on stack
+
+static void record_chunk(int rec_chunk_bytes) {
+    echo.record(s_stereo_chunk, rec_chunk_bytes);
+    int frames = rec_chunk_bytes / 8;  // 8 bytes per 32-bit stereo frame
+    for (int i = 0; i < frames && g_rec_bytes + 2 <= MAX_REC_BYTES; i++) {
+        int16_t L    = (int16_t)((*(int32_t *)&s_stereo_chunk[i * 8])     >> 16);
+        int16_t R    = (int16_t)((*(int32_t *)&s_stereo_chunk[i * 8 + 4]) >> 16);
+        int16_t mono = (int16_t)(((int32_t)L + R) / 2);
+        *(int16_t *)&g_rec_buf[g_rec_bytes] = mono;
+        g_rec_bytes += 2;
+    }
+}
+
+// Send recorded mono PCM to phone via MIC_DATA notify.
+// Protocol mirrors AUDIO_RAW write: [4-byte LE total length][PCM data...]
+static void send_mic_audio() {
+    if (!g_mic_char || g_rec_bytes == 0) return;
+    notify_byte(STATUS_MIC_SEND);
+
+    uint32_t total = g_rec_bytes;
+    uint8_t  notify_buf[NOTIFY_PAYLOAD];
+
+    // First notification: 4-byte header + first data chunk
+    notify_buf[0] = total & 0xFF;
+    notify_buf[1] = (total >> 8)  & 0xFF;
+    notify_buf[2] = (total >> 16) & 0xFF;
+    notify_buf[3] = (total >> 24) & 0xFF;
+    uint32_t first = (total < (uint32_t)(NOTIFY_PAYLOAD - 4))
+                     ? total : (NOTIFY_PAYLOAD - 4);
+    memcpy(notify_buf + 4, g_rec_buf, first);
+    g_mic_char->setValue(notify_buf, 4 + first);
+    g_mic_char->notify();
+    delay(10);
+
+    uint32_t sent = first;
+    while (sent < total) {
+        uint32_t chunk = (total - sent < NOTIFY_PAYLOAD)
+                         ? (total - sent) : NOTIFY_PAYLOAD;
+        g_mic_char->setValue(g_rec_buf + sent, chunk);
+        g_mic_char->notify();
+        sent += chunk;
+        delay(10);  // let BLE stack flush between notifications
+    }
+
+    notify_byte(STATUS_DONE);
+}
+
+// ---------------------------------------------------------------------------
+// Custom Flite allocator (CST_USER_MALLOC).
+// Wave buffers are 8-50 KB and cause fragmentation/exhaustion in internal SRAM
+// when BLE is running.  We route allocations >= 8 KB to PSRAM so they don't
+// compete with BLE, while keeping small synthesis structures in fast internal
+// SRAM so the synthesis inner loops aren't slowed by PSRAM cache misses.
+// ESP-IDF free() handles both internal and external (PSRAM) pointers correctly.
+// ---------------------------------------------------------------------------
+extern "C" {
+
+static const int FLITE_PSRAM_THRESHOLD = 8192;
+
+void *cst_safe_alloc(int size) {
+    if (size <= 0) size = 1;
+    void *p = nullptr;
+    if (size >= FLITE_PSRAM_THRESHOLD) {
+        p = heap_caps_calloc(1, (size_t)size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!p) {
+            Serial.printf("[cst] PSRAM calloc FAILED sz=%d psram_free=%d\n",
+                size, (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            Serial.flush();
+            p = calloc(1, (size_t)size);
+        }
+    } else {
+        p = calloc(1, (size_t)size);
+        if (!p) p = heap_caps_calloc(1, (size_t)size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!p) {
+        Serial.printf("[cst] ABORT sz=%d int_free=%d psram_free=%d\n",
+            size,
+            (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        Serial.flush();
+        abort();
+    }
+    return p;
+}
+
+void *cst_safe_calloc(int size) { return cst_safe_alloc(size); }
+
+void *cst_safe_realloc(void *p, int size) {
+    if (size <= 0) size = 1;
+    if (!p) return cst_safe_alloc(size);
+    void *np = realloc(p, (size_t)size);
+    if (!np) abort();
+    return np;
+}
+
+void cst_free(void *p) { free(p); }
+
+} // extern "C"
 
 // ---------------------------------------------------------------
 
 class ServerCallbacks : public BLEServerCallbacks {
     void onDisconnect(BLEServer *srv) override {
-        // Reset receive state in case transfer was mid-flight
         g_audio_receiving = false;
         g_audio_pending   = false;
         if (g_audio_buf) { free(g_audio_buf); g_audio_buf = nullptr; }
-        // Restart advertising so the app can reconnect
         BLEDevice::getAdvertising()->start();
     }
 };
@@ -99,31 +229,26 @@ class AudioCallback : public BLECharacteristicCallbacks {
         if (len == 0) return;
 
         if (!g_audio_receiving) {
-            // First chunk: 4-byte LE length header
             if (len < 4) return;
             g_audio_total = (uint32_t)data[0]
                           | ((uint32_t)data[1] << 8)
                           | ((uint32_t)data[2] << 16)
                           | ((uint32_t)data[3] << 24);
             if (g_audio_buf) { free(g_audio_buf); g_audio_buf = nullptr; }
-            // Try PSRAM first, fall back to heap
             g_audio_buf = (uint8_t *)heap_caps_malloc(
                 g_audio_total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!g_audio_buf)
                 g_audio_buf = (uint8_t *)malloc(g_audio_total);
-            if (!g_audio_buf) return;  // out of memory
-            g_audio_received = 0;
+            if (!g_audio_buf) return;
+            g_audio_received  = 0;
             g_audio_receiving = true;
-            notify_byte(0x01);  // 0x01 = receiving
-
-            // Copy payload after header
+            notify_byte(STATUS_RECEIVING);
             size_t payload = len - 4;
             if (payload > 0) {
                 memcpy(g_audio_buf, data + 4, payload);
                 g_audio_received = payload;
             }
         } else {
-            // Subsequent chunks: raw PCM data
             uint32_t space = g_audio_total - g_audio_received;
             uint32_t copy  = (len < space) ? len : space;
             memcpy(g_audio_buf + g_audio_received, data, copy);
@@ -146,7 +271,7 @@ class TtsCallback : public BLECharacteristicCallbacks {
         memcpy(g_tts_buf, val.c_str(), len);
         g_tts_buf[len] = '\0';
         g_tts_pending = true;
-        notify_byte(0x01);  // 0x01 = receiving
+        notify_byte(STATUS_RECEIVING);
     }
 };
 
@@ -154,12 +279,30 @@ class TtsCallback : public BLECharacteristicCallbacks {
 
 void setup() {
     delay(500);
+    Serial.begin(115200);
+    Serial.printf("[boot] int_free=%d psram_free=%d psram_size=%d\n",
+        (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+        (int)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+
+    // No heap_caps_malloc_extmem_enable — Flite uses the custom cst_* allocator
+    // below (CST_USER_MALLOC) which routes large allocs to PSRAM explicitly.
+
+    // WDT at 30s — Flite init and synthesis legitimately exceed the default 5s.
+    esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
+    esp_task_wdt_reconfigure(&wdt_cfg);
+
+    // Init Flite BEFORE BLE — BLE consumes heap Flite needs
+    g_flite = new Flite();
+    g_flite->setVoice(register_cmu_us_kal());
+
+    pinMode(BTN_PIN, INPUT_PULLUP);
 
     BLEDevice::setMTU(512);
     BLEDevice::init("AudioTag");
     BLEServer  *srv = BLEDevice::createServer();
     srv->setCallbacks(new ServerCallbacks());
-    BLEService *svc = srv->createService(BLEUUID(SVC_UUID), 16);
+    BLEService *svc = srv->createService(BLEUUID(SVC_UUID), 20);
 
     BLECharacteristic *audio = svc->createCharacteristic(
         AUDIO_UUID, BLECharacteristic::PROPERTY_WRITE);
@@ -173,6 +316,10 @@ void setup() {
         STA_UUID, BLECharacteristic::PROPERTY_NOTIFY);
     g_sta_char->addDescriptor(new BLE2902());
 
+    g_mic_char = svc->createCharacteristic(
+        MIC_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    g_mic_char->addDescriptor(new BLE2902());
+
     svc->start();
     BLEDevice::getAdvertising()->start();
 
@@ -183,54 +330,99 @@ void setup() {
         return;
     }
     echo.setSpeakerVolume(80);
+    echo.setMicGain(ES8311_MIC_GAIN_6DB);   // modest boost — 18dB caused clipping
 
-    beeps(3);  // 3 beeps = audio OK
+    // Allocate recording buffer — try PSRAM first, fall back to heap
+    g_rec_buf = (uint8_t *)heap_caps_malloc(
+        MAX_REC_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_rec_buf)
+        g_rec_buf = (uint8_t *)heap_caps_malloc(
+            MAX_REC_BYTES_5S, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_rec_buf)
+        g_rec_buf = (uint8_t *)malloc(MAX_REC_BYTES_3S);  // 3s in regular heap
 
-    g_flite = new Flite();
-    g_flite->setVoice(register_cmu_us_kal());
+    beeps(3);  // 3 beeps = audio + rec buffer OK
+    if (g_rec_buf) beeps(1);  // +1 beep = PSRAM rec buffer allocated
 
-    beeps(1);  // 1 beep = Flite OK, ready
+    // Flite init deferred to first TTS use — avoids WDT timeout during boot
 }
 
 void loop() {
-    // --- Raw PCM audio from phone ---
+    // --- PTT button handling ---
+    bool btn_pressed = (digitalRead(BTN_PIN) == LOW);
+
+    if (btn_pressed && !g_btn_last) {
+        // Button just pressed — start recording.
+        // Note: TX auto_clear=true (ESP-IDF 5 new I2S API default) keeps speaker
+        // outputting silence while we only call record(), so no acoustic feedback.
+        g_rec_bytes = 0;
+        notify_byte(STATUS_RECORDING);
+    }
+
+    if (btn_pressed && g_rec_buf) {
+        // Button held — record one chunk (160 stereo frames × 4 bytes = 640 DMA bytes = 20ms at 8kHz)
+        record_chunk(REC_CHUNK_BYTES);
+    }
+
+    if (!btn_pressed && g_btn_last) {
+        // Button just released — skip beeps (I2S TX crashes after long RX session).
+        // Android app shows status via BLE STATUS notifications.
+        if (g_rec_bytes > 0) {
+            g_rec_pending = true;
+        }
+    }
+    g_btn_last = btn_pressed;
+
+    // --- Send mic audio to phone for STT ---
+    if (g_rec_pending) {
+        g_rec_pending = false;
+        send_mic_audio();
+        return;
+    }
+
+    // --- Raw PCM audio from phone → speaker ---
     if (g_audio_pending) {
         g_audio_pending = false;
         int n_samples = g_audio_total / sizeof(int16_t);
         play_mono16((const int16_t *)g_audio_buf, n_samples);
         free(g_audio_buf);
         g_audio_buf = nullptr;
-        notify_byte(0x02);  // 0x02 = done (matches Android app expectation)
+        notify_byte(STATUS_DONE);
         return;
     }
 
-    // --- Text → Flite TTS ---
+    // --- Text → Flite TTS → speaker ---
+    // Runs in the Arduino loop task.  CONFIG_ARDUINO_LOOP_STACK_SIZE=32768 gives
+    // Flite enough stack for multi-word synthesis without overflow.
     if (g_tts_pending) {
         g_tts_pending = false;
-        cst_wave *wave = g_flite->textToWave(g_tts_buf);
+        cst_wave *wave = g_flite ? g_flite->textToWave(g_tts_buf) : nullptr;
         if (wave && wave->num_samples > 0) {
-            // kal voice: 8kHz mono → upsample 2× + stereo for M5EchoBase
             int n = wave->num_samples;
             const int CHUNK = 256;
-            int16_t chunk_buf[CHUNK * 4];
+            int32_t chunk_buf[CHUNK * 4];  // 2× upsampled stereo 32-bit
             for (int i = 0; i < n; i += CHUNK) {
                 int cnt = (i + CHUNK < n) ? CHUNK : (n - i);
                 for (int j = 0; j < cnt; j++) {
                     int16_t s0  = wave->samples[i + j];
                     int16_t s1  = (i + j + 1 < n) ? wave->samples[i + j + 1] : s0;
                     int16_t mid = (int16_t)(((int32_t)s0 + s1) / 2);
-                    chunk_buf[j*4+0] = s0;
-                    chunk_buf[j*4+1] = s0;
-                    chunk_buf[j*4+2] = mid;
-                    chunk_buf[j*4+3] = mid;
+                    chunk_buf[j*4+0] = (int32_t)s0  << 16;
+                    chunk_buf[j*4+1] = (int32_t)s0  << 16;
+                    chunk_buf[j*4+2] = (int32_t)mid << 16;
+                    chunk_buf[j*4+3] = (int32_t)mid << 16;
                 }
-                echo.play((const uint8_t *)chunk_buf, cnt * 4 * sizeof(int16_t));
+                echo.play((const uint8_t *)chunk_buf, cnt * 4 * sizeof(int32_t));
             }
             delete_wave(wave);
         }
-        notify_byte(0x02);  // done
+        notify_byte(STATUS_DONE);
         return;
     }
 
-    delay(50);
+    // When idle (button not pressed), drain the RX DMA so stale audio never
+    // accumulates before a recording session.
+    if (!btn_pressed) {
+        echo.record(s_stereo_chunk, REC_CHUNK_BYTES);  // drain + discard
+    }
 }
