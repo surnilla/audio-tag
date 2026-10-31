@@ -164,7 +164,7 @@ static void send_mic_audio() {
     memcpy(notify_buf + 4, g_rec_buf, first);
     g_mic_char->setValue(notify_buf, 4 + first);
     g_mic_char->notify();
-    delay(10);
+    delay(20);
 
     uint32_t sent = first;
     while (sent < total) {
@@ -173,7 +173,7 @@ static void send_mic_audio() {
         g_mic_char->setValue(g_rec_buf + sent, chunk);
         g_mic_char->notify();
         sent += chunk;
-        delay(10);  // let BLE stack flush between notifications
+        delay(20);  // Coded PHY S8 ≈ 12 KB/s; 244 bytes per 20 ms fits within budget
     }
 
     notify_byte(STATUS_DONE);
