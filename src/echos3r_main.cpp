@@ -25,6 +25,7 @@
 #define TTS_UUID   "12345678-1234-1234-1234-1234567890ad"  // write: text → Flite TTS
 #define STA_UUID   "12345678-1234-1234-1234-1234567890ae"  // notify: status
 #define MIC_UUID   "12345678-1234-1234-1234-1234567890af"  // notify: mic PCM → phone STT
+#define ALM_UUID   "12345678-1234-1234-1234-1234567890b0"  // write: trigger alarm playback
 
 // Status byte values
 #define STATUS_RECEIVING  0x01
@@ -63,6 +64,11 @@ static uint8_t  *g_rec_buf   = nullptr;  // mono PCM in PSRAM
 static uint32_t  g_rec_bytes = 0;        // bytes recorded so far
 static bool      g_btn_last  = false;    // previous button state
 static volatile bool g_rec_pending = false;
+
+// --- Pre-generated alarm PCM (built at boot, stored in PSRAM) ---
+static uint8_t  *g_alarm_buf       = nullptr;
+static uint32_t  g_alarm_size      = 0;
+static volatile bool g_alarm_pending = false;
 
 // --- Replay last received message (double-tap G41) ---
 static uint8_t  *g_replay_pcm_buf  = nullptr;  // saved Phone Voice PCM (PSRAM)
@@ -227,6 +233,48 @@ void cst_free(void *p) { free(p); }
 
 // ---------------------------------------------------------------
 
+// Build a 1.5-second siren alarm into PSRAM at boot.
+// Three 400 ms rising sweeps (800 → 1600 Hz) with 100 ms silence between them.
+// Uses chirp synthesis (accumulating phase) to avoid frequency discontinuities.
+static void build_alarm_pcm() {
+    const float SWEEP_S  = 0.4f;   // sweep duration (s)
+    const float PAUSE_S  = 0.1f;   // silence between sweeps (s)
+    const int   REPEATS  = 3;
+    const float F_LOW    = 800.0f;
+    const float F_HIGH   = 1600.0f;
+    const int   AMP      = 28000;
+
+    int sweep_n  = (int)(SWEEP_S * SAMPLE_RATE);
+    int pause_n  = (int)(PAUSE_S * SAMPLE_RATE);
+    int total_n  = REPEATS * (sweep_n + pause_n);
+    g_alarm_size = (uint32_t)(total_n * sizeof(int16_t));
+
+    g_alarm_buf = (uint8_t *)heap_caps_malloc(g_alarm_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_alarm_buf) g_alarm_buf = (uint8_t *)malloc(g_alarm_size);
+    if (!g_alarm_buf) return;
+
+    int16_t *pcm = (int16_t *)g_alarm_buf;
+    int idx = 0;
+    for (int r = 0; r < REPEATS; r++) {
+        float phase = 0.0f;
+        for (int i = 0; i < sweep_n; i++) {
+            float progress = (float)i / sweep_n;
+            float freq = F_LOW + (F_HIGH - F_LOW) * progress;
+            phase += 2.0f * M_PI * freq / SAMPLE_RATE;
+            pcm[idx++] = (int16_t)(AMP * sinf(phase));
+        }
+        for (int i = 0; i < pause_n; i++) {
+            pcm[idx++] = 0;
+        }
+    }
+}
+
+class AlarmCallback : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *) override {
+        g_alarm_pending = true;
+    }
+};
+
 class ServerCallbacks : public BLEServerCallbacks {
     void onDisconnect(BLEServer *srv) override {
         g_audio_receiving = false;
@@ -302,6 +350,9 @@ void setup() {
     esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
     esp_task_wdt_reconfigure(&wdt_cfg);
 
+    // Pre-generate alarm PCM into PSRAM (1.5 s siren sweep)
+    build_alarm_pcm();
+
     // Init Flite BEFORE BLE — BLE consumes heap Flite needs
     g_flite = new Flite();
     g_flite->setVoice(register_cmu_us_kal());
@@ -318,7 +369,7 @@ void setup() {
     );
     BLEServer  *srv = BLEDevice::createServer();
     srv->setCallbacks(new ServerCallbacks());
-    BLEService *svc = srv->createService(BLEUUID(SVC_UUID), 20);
+    BLEService *svc = srv->createService(BLEUUID(SVC_UUID), 25);
 
     BLECharacteristic *audio = svc->createCharacteristic(
         AUDIO_UUID, BLECharacteristic::PROPERTY_WRITE);
@@ -327,6 +378,10 @@ void setup() {
     BLECharacteristic *tts = svc->createCharacteristic(
         TTS_UUID, BLECharacteristic::PROPERTY_WRITE);
     tts->setCallbacks(new TtsCallback());
+
+    BLECharacteristic *alm = svc->createCharacteristic(
+        ALM_UUID, BLECharacteristic::PROPERTY_WRITE);
+    alm->setCallbacks(new AlarmCallback());
 
     g_sta_char = svc->createCharacteristic(
         STA_UUID, BLECharacteristic::PROPERTY_NOTIFY);
@@ -419,6 +474,16 @@ void loop() {
     if (g_rec_pending) {
         g_rec_pending = false;
         send_mic_audio();
+        return;
+    }
+
+    // --- Alarm trigger from phone/gateway ---
+    if (g_alarm_pending) {
+        g_alarm_pending = false;
+        if (g_alarm_buf && g_alarm_size > 0) {
+            play_mono16((const int16_t *)g_alarm_buf,
+                        (int)(g_alarm_size / sizeof(int16_t)));
+        }
         return;
     }
 
