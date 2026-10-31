@@ -127,19 +127,24 @@ static void play_mono16(const int16_t *pcm, int n_samples) {
     }
 }
 
-// Record one chunk of stereo audio and convert to mono into g_rec_buf.
+// Record one chunk of stereo audio, decimate 2:1, and store 8 kHz mono in g_rec_buf.
 // I2S is 32-bit stereo: each DMA frame = 8 bytes [L:4 bytes, R:4 bytes].
-// ES8311_RESOLUTION_32 sends 24-bit audio MSB-aligned; top 16 bits = signal.
+// Decimation: average pairs of 16 kHz frames → 8 kHz output.
+// This halves the data sent over BLE (fixes Coded PHY throughput margin) and
+// matches MIC_SAMPLE_RATE = 8000 declared in the Android app's WAV header.
 #define REC_CHUNK_BYTES 1280   // 160 frames × 8 bytes = 10ms at 16kHz 32-bit stereo
 static uint8_t s_stereo_chunk[REC_CHUNK_BYTES];  // static — no VLA on stack
 
 static void record_chunk(int rec_chunk_bytes) {
     echo.record(s_stereo_chunk, rec_chunk_bytes);
     int frames = rec_chunk_bytes / 8;  // 8 bytes per 32-bit stereo frame
-    for (int i = 0; i < frames && g_rec_bytes + 2 <= MAX_REC_BYTES; i++) {
-        int16_t L    = (int16_t)((*(int32_t *)&s_stereo_chunk[i * 8])     >> 16);
-        int16_t R    = (int16_t)((*(int32_t *)&s_stereo_chunk[i * 8 + 4]) >> 16);
-        int16_t mono = (int16_t)(((int32_t)L + R) / 2);
+    // Process pairs of frames → 8 kHz output (2:1 decimation with averaging)
+    for (int i = 0; i + 1 < frames && g_rec_bytes + 2 <= MAX_REC_BYTES; i += 2) {
+        int16_t L0   = (int16_t)((*(int32_t *)&s_stereo_chunk[(i)   * 8])     >> 16);
+        int16_t R0   = (int16_t)((*(int32_t *)&s_stereo_chunk[(i)   * 8 + 4]) >> 16);
+        int16_t L1   = (int16_t)((*(int32_t *)&s_stereo_chunk[(i+1) * 8])     >> 16);
+        int16_t R1   = (int16_t)((*(int32_t *)&s_stereo_chunk[(i+1) * 8 + 4]) >> 16);
+        int16_t mono = (int16_t)(((int32_t)L0 + R0 + L1 + R1) / 4);
         *(int16_t *)&g_rec_buf[g_rec_bytes] = mono;
         g_rec_bytes += 2;
     }
@@ -173,6 +178,7 @@ static void send_mic_audio() {
         g_mic_char->setValue(g_rec_buf + sent, chunk);
         g_mic_char->notify();
         sent += chunk;
+        esp_task_wdt_reset();  // feed WDT — loop runs ~13s for a 10s 8kHz recording
         delay(20);  // Coded PHY S8 ≈ 12 KB/s; 244 bytes per 20 ms fits within budget
     }
 
