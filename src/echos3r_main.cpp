@@ -298,7 +298,7 @@ void setup() {
 
     // Init Flite BEFORE BLE — BLE consumes heap Flite needs
     g_flite = new Flite();
-    g_flite->setVoice(register_cmu_us_kal());
+    g_flite->setVoice(register_cmu_us_slt());  // slt = female, clearer than kal (male)
 
     pinMode(BTN_PIN, INPUT_PULLUP);
 
@@ -339,7 +339,7 @@ void setup() {
                    PIN_I2S_DIN, PIN_I2S_WS, PIN_I2S_DOUT, PIN_I2S_BCLK)) {
         return;
     }
-    echo.setSpeakerVolume(90);
+    echo.setSpeakerVolume(85);
     echo.setMicGain(ES8311_MIC_GAIN_6DB);   // modest boost — 18dB caused clipping
 
     // Allocate recording buffer — try PSRAM first, fall back to heap
