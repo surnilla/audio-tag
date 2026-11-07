@@ -6,6 +6,7 @@
 #include <M5EchoBase.h>
 #include <esp_task_wdt.h>
 #include "flite_arduino.h"
+#include "wake_word.h"
 
 #define AMP_ENABLE   18
 #define PIN_I2C_SDA  45
@@ -65,6 +66,19 @@ static uint32_t  g_rec_bytes = 0;        // bytes recorded so far
 static bool      g_btn_last  = false;    // previous button state
 static volatile bool g_rec_pending = false;
 
+// --- Wake-word state machine ---
+// WW_LISTEN: feeding mic audio to EI continuously looking for "Hey Mobi"
+// WW_RECORD: wake word detected, now recording the user's message
+enum WwState { WW_LISTEN, WW_RECORD };
+static volatile WwState g_ww_state = WW_LISTEN;
+#define WW_SILENCE_THRESH      400   // int16 RMS below this = silence
+#define WW_SPEECH_THRESH      1200   // int16 RMS above this = real speech
+#define WW_SILENCE_END_MS     1500   // 1.5 s of silence ends WW recording
+#define WW_MIN_RECORD_MS       600   // don't check silence until at least this long after start
+static uint32_t g_ww_silence_start  = 0;  // millis() when silence began (0=not in silence)
+static uint32_t g_ww_record_start   = 0;  // millis() when WW_RECORD began
+static bool     g_ww_speech_seen    = false;  // true once real speech (RMS > WW_SPEECH_THRESH) is captured
+
 // --- Pre-generated alarm PCM (built at boot, stored in PSRAM) ---
 static uint8_t  *g_alarm_buf       = nullptr;
 static uint32_t  g_alarm_size      = 0;
@@ -111,6 +125,20 @@ static void play_notification() {
     delay(2500);            // pause → ~3.8 s total from chime start to message
 }
 
+// Two rising tones: acknowledges "Hey Mobi" and signals "listening"
+static void play_ww_chime_start() {
+    play_beep(880, 80);    // A5
+    delay(40);
+    play_beep(1318, 120);  // E6 — rising interval
+}
+
+// Single short falling tone: message captured, sending
+static void play_ww_chime_end() {
+    play_beep(880, 100);   // A5
+    delay(40);
+    play_beep(587, 150);   // D5 — falling interval
+}
+
 static void notify_byte(uint8_t val) {
     if (!g_sta_char) return;
     g_sta_char->setValue(&val, 1);
@@ -154,6 +182,18 @@ static void record_chunk(int rec_chunk_bytes) {
         *(int16_t *)&g_rec_buf[g_rec_bytes] = mono;
         g_rec_bytes += 2;
     }
+}
+
+// Compute approximate RMS of the most-recent stereo I2S chunk (left channel only).
+// Used for silence detection in wake-word recording mode.
+static int16_t chunk_rms() {
+    int frames = REC_CHUNK_BYTES / 8;
+    int64_t sum_sq = 0;
+    for (int i = 0; i < frames; i++) {
+        int16_t L = (int16_t)((*(const int32_t *)&s_stereo_chunk[i * 8]) >> 16);
+        sum_sq += (int64_t)L * L;
+    }
+    return (int16_t)sqrtf((float)sum_sq / frames);
 }
 
 // Send recorded mono PCM to phone via MIC_DATA notify.
@@ -429,6 +469,11 @@ void loop() {
 
     if (btn_pressed && !g_btn_last) {
         s_press_start_ms = millis();
+        // PTT overrides any active wake-word recording session
+        if (g_ww_state == WW_RECORD) {
+            g_ww_state        = WW_LISTEN;
+            g_ww_silence_start = 0;
+        }
         if (s_short_press_pending &&
                 (millis() - s_short_press_time < DOUBLE_TAP_WINDOW)) {
             // Second short tap within window → replay last message
@@ -581,6 +626,7 @@ void loop() {
 
     // When idle (button not pressed), drain the RX DMA so stale audio never
     // accumulates before a recording session.
+    // NOTE: Wake word disabled — retrain EI model with work-site noise before re-enabling.
     if (!btn_pressed) {
         echo.record(s_stereo_chunk, REC_CHUNK_BYTES);  // drain + discard
     }
