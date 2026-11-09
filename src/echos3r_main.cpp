@@ -17,8 +17,9 @@
 #define PIN_I2S_BCLK  17
 #define SAMPLE_RATE  16000
 #define BTN_PIN            41   // G41 push-to-talk button (active LOW)
-#define SHORT_TAP_MS       250  // press ≤ this = short tap (candidate for double-tap)
-#define DOUBLE_TAP_WINDOW  400  // two short taps within this window = replay
+#define SHORT_TAP_MS       250  // press ≤ this = short tap (candidate for multi-tap)
+#define DOUBLE_TAP_WINDOW  400  // two short taps within this window = potential replay
+#define TRIPLE_TAP_WINDOW  600  // three short taps within this window = toggle WW
 
 // UUIDs matching audio-tag-android app
 #define SVC_UUID   "12345678-1234-1234-1234-1234567890ab"
@@ -70,7 +71,8 @@ static volatile bool g_rec_pending = false;
 // WW_LISTEN: feeding mic audio to EI continuously looking for "Hey Mobi"
 // WW_RECORD: wake word detected, now recording the user's message
 enum WwState { WW_LISTEN, WW_RECORD };
-static volatile WwState g_ww_state = WW_LISTEN;
+static volatile WwState g_ww_state   = WW_LISTEN;
+static bool             g_ww_enabled = true;   // triple-tap G41 toggles on/off
 #define WW_ENERGY_GATE         100   // min RMS to run EI inference — filters true silence
 #define WW_SILENCE_THRESH      400   // int16 RMS below this = silence (during recording)
 #define WW_SPEECH_THRESH       800   // int16 RMS above this = real speech
@@ -478,32 +480,44 @@ void loop() {
     // --- PTT / double-tap button handling ---
     bool btn_pressed = (digitalRead(BTN_PIN) == LOW);
 
-    // Statics for double-tap detection
+    // Statics for multi-tap detection (double-tap = replay, triple-tap = toggle WW)
     static uint32_t s_press_start_ms      = 0;
     static bool     s_short_press_pending = false;
     static uint32_t s_short_press_time    = 0;
+    static bool     s_double_press_pending = false;
+    static uint32_t s_double_press_time    = 0;
 
     if (btn_pressed && !g_btn_last) {
         s_press_start_ms = millis();
         // PTT overrides any active wake-word recording session
         if (g_ww_state == WW_RECORD) {
-            g_ww_state        = WW_LISTEN;
+            g_ww_state         = WW_LISTEN;
             g_ww_silence_start = 0;
         }
-        if (s_short_press_pending &&
+        if (s_double_press_pending &&
+                (millis() - s_double_press_time < TRIPLE_TAP_WINDOW)) {
+            // Third short tap → toggle wake word on/off
+            s_double_press_pending = false;
+            s_short_press_pending  = false;
+            g_ww_enabled = !g_ww_enabled;
+            if (g_ww_enabled) ww_restart();  // clear EI window before resuming
+            beeps(g_ww_enabled ? 1 : 2);     // 1 beep = on, 2 beeps = off
+        } else if (s_short_press_pending &&
                 (millis() - s_short_press_time < DOUBLE_TAP_WINDOW)) {
-            // Second short tap within window → replay last message
-            s_short_press_pending = false;
-            g_replay_pending = true;
+            // Second short tap — park as double-pending; fire replay if no third tap
+            s_short_press_pending  = false;
+            s_double_press_pending = true;
+            s_double_press_time    = millis();
         } else {
             // Normal PTT press — start recording
-            s_short_press_pending = false;
+            s_short_press_pending  = false;
+            s_double_press_pending = false;
             g_rec_bytes = 0;
             notify_byte(STATUS_RECORDING);
         }
     }
 
-    if (btn_pressed && g_rec_buf && !g_replay_pending) {
+    if (btn_pressed && g_rec_buf && !g_replay_pending && !s_double_press_pending) {
         // Held — record one chunk (~10 ms at 16 kHz 32-bit stereo)
         record_chunk(REC_CHUNK_BYTES);
     }
@@ -511,22 +525,30 @@ void loop() {
     if (!btn_pressed && g_btn_last && !g_replay_pending) {
         uint32_t dur = millis() - s_press_start_ms;
         if (dur < SHORT_TAP_MS) {
-            // Short tap — first of a potential double-tap; discard the tiny recording
+            // Short tap — first of a potential multi-tap; discard the tiny recording
             notify_byte(STATUS_DONE);   // clear phone's "Recording…" state
             g_rec_bytes = 0;
             s_short_press_pending = true;
             s_short_press_time    = millis();
         } else {
             // Long press — PTT complete, send audio
-            s_short_press_pending = false;
+            s_short_press_pending  = false;
+            s_double_press_pending = false;
             if (g_rec_bytes > 0) g_rec_pending = true;
         }
     }
 
-    // Expire the double-tap window
+    // Expire the single-tap window
     if (s_short_press_pending &&
             (millis() - s_short_press_time >= DOUBLE_TAP_WINDOW)) {
         s_short_press_pending = false;
+    }
+
+    // Expire the double-tap window → fire replay (no third tap came)
+    if (s_double_press_pending &&
+            (millis() - s_double_press_time >= TRIPLE_TAP_WINDOW)) {
+        s_double_press_pending = false;
+        g_replay_pending = true;
     }
 
     g_btn_last = btn_pressed;
@@ -673,7 +695,7 @@ void loop() {
             // from a fresh state rather than accumulating stale "Hey Mobi" features.
             echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
             int16_t ww_rms = chunk_rms();
-            if (ww_rms > WW_ENERGY_GATE && !ww_in_cooldown() && ww_feed(s_stereo_chunk, REC_CHUNK_BYTES)) {
+            if (g_ww_enabled && ww_rms > WW_ENERGY_GATE && !ww_in_cooldown() && ww_feed(s_stereo_chunk, REC_CHUNK_BYTES)) {
                 play_ww_chime_start();
                 // Reset EI rolling window immediately so chime audio (which the
                 // mic picks up) cannot re-trigger detection when we return to LISTEN.

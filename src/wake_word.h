@@ -21,3 +21,7 @@ bool ww_in_cooldown();
 
 // Discard the partially accumulated slice without running inference.
 void ww_reset_slice();
+
+// Clear EI rolling window and slice state without starting a cooldown.
+// Call this when re-enabling wake word after it was disabled.
+void ww_restart();

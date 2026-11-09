@@ -57,6 +57,14 @@ void ww_reset() {
     s_last_det_ms = millis();  // start 8 s cooldown from now
 }
 
+void ww_restart() {
+    // Clear EI rolling window and slice state without touching the cooldown.
+    // Used when re-enabling WW so stale pre-disable features don't cause a false trigger.
+    run_classifier_init();
+    s_slice_idx  = 0;
+    s_consec_det = 0;
+}
+
 void ww_reset_slice() {
     // Discard the current partial slice — low-energy audio is thrown away so the
     // classifier only ever sees chunks that actually contain speech.
