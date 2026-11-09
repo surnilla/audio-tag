@@ -153,7 +153,7 @@ const ei_impulse_t impulse_1155410_1 = {
     .project_name = "hey mobi project",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 3,
+    .deploy_version = 4,
 
     .nn_input_frame_size = 650,
     .raw_sample_count = 16000,

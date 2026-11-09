@@ -18,7 +18,7 @@
 static_assert(EI_CLASSIFIER_SLICE_SIZE == 4000,
               "EI_CLASSIFIER_SLICE_SIZE must be 4000 (1 s / 4 slices at 16 kHz)");
 
-#define WW_THRESHOLD        0.80f   // minimum Hey_mobi confidence per slice
+#define WW_THRESHOLD        0.70f   // minimum Hey_mobi confidence per slice
 #define WW_CONSEC_SLICES    2       // must exceed threshold this many slices in a row
 #define WW_COOLDOWN_MS      8000    // ignore re-detections for 8 s after a trigger
 

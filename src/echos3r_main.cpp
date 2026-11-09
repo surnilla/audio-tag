@@ -71,7 +71,7 @@ static volatile bool g_rec_pending = false;
 // WW_RECORD: wake word detected, now recording the user's message
 enum WwState { WW_LISTEN, WW_RECORD };
 static volatile WwState g_ww_state = WW_LISTEN;
-#define WW_ENERGY_GATE         300   // min RMS to run EI inference (ambient ~50-150, speech ~400+)
+#define WW_ENERGY_GATE         100   // min RMS to run EI inference — filters true silence
 #define WW_SILENCE_THRESH      400   // int16 RMS below this = silence (during recording)
 #define WW_SPEECH_THRESH       800   // int16 RMS above this = real speech
 #define WW_SILENCE_END_MS     1500   // 1.5 s of silence ends WW recording
@@ -442,7 +442,7 @@ void setup() {
         return;
     }
     echo.setSpeakerVolume(85);
-    echo.setMicGain(ES8311_MIC_GAIN_6DB);   // modest boost — 18dB caused clipping
+    echo.setMicGain(ES8311_MIC_GAIN_6DB);   // must match gain used during EI model training
 
     // Allocate recording buffer — try PSRAM first, fall back to heap
     g_rec_buf = (uint8_t *)heap_caps_malloc(
@@ -460,9 +460,8 @@ void setup() {
                   heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    // Wake word disabled — EI model needs retraining with work-site ambient noise.
-    // Re-enable by calling ww_init() here once a better model is in lib/ei-hey-mobi/.
-    // ww_init();
+    // Initialise Edge Impulse continuous inference for "Hey Mobi" wake word
+    ww_init();
 
     // Flite init deferred to first TTS use — avoids WDT timeout during boot
 }
@@ -673,7 +672,8 @@ void loop() {
             // EI — this keeps the rolling window clean so detection always restarts
             // from a fresh state rather than accumulating stale "Hey Mobi" features.
             echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
-            if (!ww_in_cooldown() && ww_feed(s_stereo_chunk, REC_CHUNK_BYTES)) {
+            int16_t ww_rms = chunk_rms();
+            if (ww_rms > WW_ENERGY_GATE && !ww_in_cooldown() && ww_feed(s_stereo_chunk, REC_CHUNK_BYTES)) {
                 play_ww_chime_start();
                 // Reset EI rolling window immediately so chime audio (which the
                 // mic picks up) cannot re-trigger detection when we return to LISTEN.
