@@ -57,6 +57,18 @@ void ww_reset() {
     s_last_det_ms = millis();  // start 8 s cooldown from now
 }
 
+void ww_reset_slice() {
+    // Discard the current partial slice — low-energy audio is thrown away so the
+    // classifier only ever sees chunks that actually contain speech.
+    s_slice_idx  = 0;
+    s_consec_det = 0;
+}
+
+bool ww_in_cooldown() {
+    if (!s_ei_inited || s_last_det_ms == 0) return false;
+    return (millis() - s_last_det_ms) <= WW_COOLDOWN_MS;
+}
+
 bool ww_feed(const uint8_t *stereo_chunk, int chunk_bytes) {
     if (!s_ei_inited) return false;
 
@@ -84,20 +96,24 @@ bool ww_feed(const uint8_t *stereo_chunk, int chunk_bytes) {
 
             // Label 0 = "Hey_mobi", label 1 = "unknown"
             float hey_mobi_score = result.classification[0].value;
-            uint32_t now = millis();
-            if ((now - s_last_det_ms) <= WW_COOLDOWN_MS) {
-                s_consec_det = 0;  // in cooldown — don't accumulate
-                continue;
-            }
+
+            // Log score as integer (0-100) to avoid printf float issues
+            int score_pct = (int)(hey_mobi_score * 100.0f);
+            Serial.print("WW ");
+            Serial.println(score_pct);
+            Serial.flush();
+
             if (hey_mobi_score > WW_THRESHOLD) {
                 s_consec_det++;
                 if (s_consec_det >= WW_CONSEC_SLICES) {
                     s_consec_det  = 0;
-                    s_last_det_ms = now;
+                    s_last_det_ms = millis();
+                    Serial.println("WW DETECTED");
+                    Serial.flush();
                     return true;
                 }
             } else {
-                s_consec_det = 0;  // broken streak — reset
+                s_consec_det = 0;
             }
         }
     }

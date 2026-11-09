@@ -71,8 +71,9 @@ static volatile bool g_rec_pending = false;
 // WW_RECORD: wake word detected, now recording the user's message
 enum WwState { WW_LISTEN, WW_RECORD };
 static volatile WwState g_ww_state = WW_LISTEN;
-#define WW_SILENCE_THRESH      400   // int16 RMS below this = silence
-#define WW_SPEECH_THRESH      1200   // int16 RMS above this = real speech
+#define WW_ENERGY_GATE         300   // min RMS to run EI inference (ambient ~50-150, speech ~400+)
+#define WW_SILENCE_THRESH      400   // int16 RMS below this = silence (during recording)
+#define WW_SPEECH_THRESH       800   // int16 RMS above this = real speech
 #define WW_SILENCE_END_MS     1500   // 1.5 s of silence ends WW recording
 #define WW_MIN_RECORD_MS       600   // don't check silence until at least this long after start
 static uint32_t g_ww_silence_start  = 0;  // millis() when silence began (0=not in silence)
@@ -224,7 +225,7 @@ static void send_mic_audio() {
         g_mic_char->setValue(g_rec_buf + sent, chunk);
         g_mic_char->notify();
         sent += chunk;
-        esp_task_wdt_reset();  // feed WDT — loop runs ~13s for a 10s 8kHz recording
+        // loopTask is not subscribed to TWDT — do not call esp_task_wdt_reset() here
         delay(20);  // Coded PHY S8 ≈ 12 KB/s; 244 bytes per 20 ms fits within budget
     }
 
@@ -455,10 +456,26 @@ void setup() {
     beeps(3);  // 3 beeps = audio + rec buffer OK
     if (g_rec_buf) beeps(1);  // +1 beep = PSRAM rec buffer allocated
 
+    Serial.printf("[BOOT] free heap=%u  PSRAM free=%u\n",
+                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    // Wake word disabled — EI model needs retraining with work-site ambient noise.
+    // Re-enable by calling ww_init() here once a better model is in lib/ei-hey-mobi/.
+    // ww_init();
+
     // Flite init deferred to first TTS use — avoids WDT timeout during boot
 }
 
 void loop() {
+    // Heartbeat — printed every 3 s so we know loop() is alive
+    static uint32_t s_hb_ms = 0;
+    if (millis() - s_hb_ms >= 3000) {
+        s_hb_ms = millis();
+        Serial.println("HB");
+        Serial.flush();
+    }
+
     // --- PTT / double-tap button handling ---
     bool btn_pressed = (digitalRead(BTN_PIN) == LOW);
 
@@ -624,10 +641,53 @@ void loop() {
         return;
     }
 
-    // When idle (button not pressed), drain the RX DMA so stale audio never
-    // accumulates before a recording session.
-    // NOTE: Wake word disabled — retrain EI model with work-site noise before re-enabling.
+    // --- Wake-word listen / record (runs only when button not held) ---
     if (!btn_pressed) {
-        echo.record(s_stereo_chunk, REC_CHUNK_BYTES);  // drain + discard
+        if (g_ww_state == WW_RECORD) {
+            record_chunk(REC_CHUNK_BYTES);
+
+            uint32_t elapsed = millis() - g_ww_record_start;
+            int16_t rms = chunk_rms();
+            if (rms > WW_SPEECH_THRESH) g_ww_speech_seen = true;
+
+            if (elapsed >= WW_MIN_RECORD_MS) {
+                if (rms < WW_SILENCE_THRESH) {
+                    if (g_ww_silence_start == 0) {
+                        g_ww_silence_start = millis();
+                    } else if (millis() - g_ww_silence_start >= WW_SILENCE_END_MS) {
+                        g_ww_state         = WW_LISTEN;
+                        g_ww_silence_start = 0;
+                        ww_reset();
+                        if (g_ww_speech_seen && g_rec_bytes > 0) {
+                            play_ww_chime_end();
+                            g_rec_pending = true;
+                        }
+                    }
+                } else {
+                    g_ww_silence_start = 0;
+                }
+            }
+        } else {
+            // WW_LISTEN: drain mic DMA and feed to EI wake-word detector.
+            // During the post-detection cooldown, just drain the DMA without calling
+            // EI — this keeps the rolling window clean so detection always restarts
+            // from a fresh state rather than accumulating stale "Hey Mobi" features.
+            echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
+            if (!ww_in_cooldown() && ww_feed(s_stereo_chunk, REC_CHUNK_BYTES)) {
+                play_ww_chime_start();
+                // Reset EI rolling window immediately so chime audio (which the
+                // mic picks up) cannot re-trigger detection when we return to LISTEN.
+                // This starts the 8 s cooldown from right now.
+                ww_reset();
+                // Drain DMA: flush ~300 ms of chime bleed-through from I2S RX buffers
+                for (int d = 0; d < 30; d++) echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
+                g_ww_state         = WW_RECORD;
+                g_ww_silence_start = 0;
+                g_ww_record_start  = millis();
+                g_ww_speech_seen   = false;
+                g_rec_bytes        = 0;
+                notify_byte(STATUS_RECORDING);
+            }
+        }
     }
 }
