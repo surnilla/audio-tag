@@ -74,12 +74,10 @@ enum WwState { WW_LISTEN, WW_RECORD };
 static volatile WwState g_ww_state   = WW_LISTEN;
 static bool             g_ww_enabled = true;   // triple-tap G41 toggles on/off
 #define WW_SILENCE_THRESH      400   // int16 RMS below this = silence (during recording)
-#define WW_SPEECH_THRESH       800   // int16 RMS above this = real speech
 #define WW_SILENCE_END_MS     1500   // 1.5 s of silence ends WW recording
 #define WW_MIN_RECORD_MS       600   // don't check silence until at least this long after start
 static uint32_t g_ww_silence_start  = 0;  // millis() when silence began (0=not in silence)
 static uint32_t g_ww_record_start   = 0;  // millis() when WW_RECORD began
-static bool     g_ww_speech_seen    = false;  // true once real speech (RMS > WW_SPEECH_THRESH) is captured
 
 // --- Pre-generated alarm PCM (built at boot, stored in PSRAM) ---
 static uint8_t  *g_alarm_buf       = nullptr;
@@ -667,7 +665,6 @@ void loop() {
 
             uint32_t elapsed = millis() - g_ww_record_start;
             int16_t rms = chunk_rms();
-            if (rms > WW_SPEECH_THRESH) g_ww_speech_seen = true;
 
             // Also run MultiNet on the recorded audio — if user says "OVER", end immediately
             bool over_said = (g_ww_enabled && cmd_feed(s_stereo_chunk, REC_CHUNK_BYTES) == CMD_OVER);
@@ -688,7 +685,9 @@ void loop() {
             if (over_said || silence_end) {
                 g_ww_state         = WW_LISTEN;
                 g_ww_silence_start = 0;
-                if (g_ww_speech_seen && g_rec_bytes > 0) {
+                // Send if any audio was captured — don't gate on speech energy,
+                // the user may have spoken quietly or the threshold may not be met.
+                if (g_rec_bytes > 0) {
                     play_ww_chime_end();
                     g_rec_pending = true;
                 }
@@ -704,7 +703,6 @@ void loop() {
                 g_ww_state         = WW_RECORD;
                 g_ww_silence_start = 0;
                 g_ww_record_start  = millis();
-                g_ww_speech_seen   = false;
                 g_rec_bytes        = 0;
                 notify_byte(STATUS_RECORDING);
             }
