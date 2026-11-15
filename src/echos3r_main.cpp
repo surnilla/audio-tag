@@ -694,8 +694,7 @@ void loop() {
             // EI — this keeps the rolling window clean so detection always restarts
             // from a fresh state rather than accumulating stale "Hey Mobi" features.
             echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
-            int16_t ww_rms = chunk_rms();
-            if (g_ww_enabled && ww_rms > WW_ENERGY_GATE && !ww_in_cooldown() && ww_feed(s_stereo_chunk, REC_CHUNK_BYTES)) {
+            if (g_ww_enabled && !ww_in_cooldown() && ww_feed(s_stereo_chunk, REC_CHUNK_BYTES)) {
                 play_ww_chime_start();
                 // Reset EI rolling window immediately so chime audio (which the
                 // mic picks up) cannot re-trigger detection when we return to LISTEN.

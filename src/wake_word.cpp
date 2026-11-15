@@ -18,8 +18,8 @@
 static_assert(EI_CLASSIFIER_SLICE_SIZE == 4000,
               "EI_CLASSIFIER_SLICE_SIZE must be 4000 (1 s / 4 slices at 16 kHz)");
 
-#define WW_THRESHOLD        0.70f   // minimum Hey_mobi confidence per slice
-#define WW_CONSEC_SLICES    2       // must exceed threshold this many slices in a row
+#define WW_THRESHOLD        0.80f   // minimum Hey_mobi confidence per slice
+#define WW_CONSEC_SLICES    2       // must exceed threshold this many consecutive slices
 #define WW_COOLDOWN_MS      8000    // ignore re-detections for 8 s after a trigger
 
 // -----------------------------------------------------------------------
@@ -74,7 +74,17 @@ void ww_reset_slice() {
 
 bool ww_in_cooldown() {
     if (!s_ei_inited || s_last_det_ms == 0) return false;
-    return (millis() - s_last_det_ms) <= WW_COOLDOWN_MS;
+    if ((millis() - s_last_det_ms) > WW_COOLDOWN_MS) {
+        // Cooldown just expired — reinitialise the rolling window right now
+        // so the first ambient slices prime a fresh window, not one frozen
+        // empty from 8 s ago.  Clears s_last_det_ms so this runs only once.
+        run_classifier_init();
+        s_slice_idx   = 0;
+        s_consec_det  = 0;
+        s_last_det_ms = 0;
+        return false;
+    }
+    return true;
 }
 
 bool ww_feed(const uint8_t *stereo_chunk, int chunk_bytes) {
