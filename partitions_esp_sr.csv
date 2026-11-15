@@ -1,0 +1,7 @@
+# 8MB flash: 3.5MB app + 4MB model partition for ESP-SR srmodels.bin (3.2MB)
+# No OTA second slot — USB-only flashing.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000
+otadata,  data, ota,     0xe000,   0x2000
+app0,     app,  ota_0,   0x10000,  0x380000
+model,    data, spiffs,  0x390000, 0x400000

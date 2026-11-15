@@ -6,7 +6,7 @@
 #include <M5EchoBase.h>
 #include <esp_task_wdt.h>
 #include "flite_arduino.h"
-#include "wake_word.h"
+#include "cmd_word.h"
 
 #define AMP_ENABLE   18
 #define PIN_I2C_SDA  45
@@ -67,13 +67,12 @@ static uint32_t  g_rec_bytes = 0;        // bytes recorded so far
 static bool      g_btn_last  = false;    // previous button state
 static volatile bool g_rec_pending = false;
 
-// --- Wake-word state machine ---
-// WW_LISTEN: feeding mic audio to EI continuously looking for "Hey Mobi"
-// WW_RECORD: wake word detected, now recording the user's message
+// --- Command-word state machine ---
+// WW_LISTEN: feeding mic audio to MultiNet6 looking for "HEY TALKIE"
+// WW_RECORD: command detected, now recording the user's message until "OVER" or silence
 enum WwState { WW_LISTEN, WW_RECORD };
 static volatile WwState g_ww_state   = WW_LISTEN;
 static bool             g_ww_enabled = true;   // triple-tap G41 toggles on/off
-#define WW_ENERGY_GATE         100   // min RMS to run EI inference — filters true silence
 #define WW_SILENCE_THRESH      400   // int16 RMS below this = silence (during recording)
 #define WW_SPEECH_THRESH       800   // int16 RMS above this = real speech
 #define WW_SILENCE_END_MS     1500   // 1.5 s of silence ends WW recording
@@ -444,7 +443,7 @@ void setup() {
         return;
     }
     echo.setSpeakerVolume(85);
-    echo.setMicGain(ES8311_MIC_GAIN_6DB);   // must match gain used during EI model training
+    echo.setMicGain(ES8311_MIC_GAIN_6DB);
 
     // Allocate recording buffer — try PSRAM first, fall back to heap
     g_rec_buf = (uint8_t *)heap_caps_malloc(
@@ -462,8 +461,8 @@ void setup() {
                   heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    // Initialise Edge Impulse continuous inference for "Hey Mobi" wake word
-    ww_init();
+    // Initialise MultiNet6 command recogniser ("HEY TALKIE" / "OVER")
+    cmd_init();
 
     // Flite init deferred to first TTS use — avoids WDT timeout during boot
 }
@@ -500,8 +499,7 @@ void loop() {
             s_double_press_pending = false;
             s_short_press_pending  = false;
             g_ww_enabled = !g_ww_enabled;
-            if (g_ww_enabled) ww_restart();  // clear EI window before resuming
-            beeps(g_ww_enabled ? 1 : 2);     // 1 beep = on, 2 beeps = off
+            beeps(g_ww_enabled ? 1 : 2);  // 1 beep = on, 2 beeps = off
         } else if (s_short_press_pending &&
                 (millis() - s_short_press_time < DOUBLE_TAP_WINDOW)) {
             // Second short tap — park as double-pending; fire replay if no third tap
@@ -665,41 +663,42 @@ void loop() {
     // --- Wake-word listen / record (runs only when button not held) ---
     if (!btn_pressed) {
         if (g_ww_state == WW_RECORD) {
-            record_chunk(REC_CHUNK_BYTES);
+            record_chunk(REC_CHUNK_BYTES);  // also fills s_stereo_chunk via echo.record()
 
             uint32_t elapsed = millis() - g_ww_record_start;
             int16_t rms = chunk_rms();
             if (rms > WW_SPEECH_THRESH) g_ww_speech_seen = true;
 
+            // Also run MultiNet on the recorded audio — if user says "OVER", end immediately
+            bool over_said = (g_ww_enabled && cmd_feed(s_stereo_chunk, REC_CHUNK_BYTES) == CMD_OVER);
+
+            bool silence_end = false;
             if (elapsed >= WW_MIN_RECORD_MS) {
                 if (rms < WW_SILENCE_THRESH) {
                     if (g_ww_silence_start == 0) {
                         g_ww_silence_start = millis();
                     } else if (millis() - g_ww_silence_start >= WW_SILENCE_END_MS) {
-                        g_ww_state         = WW_LISTEN;
-                        g_ww_silence_start = 0;
-                        ww_reset();
-                        if (g_ww_speech_seen && g_rec_bytes > 0) {
-                            play_ww_chime_end();
-                            g_rec_pending = true;
-                        }
+                        silence_end = true;
                     }
                 } else {
                     g_ww_silence_start = 0;
                 }
             }
+
+            if (over_said || silence_end) {
+                g_ww_state         = WW_LISTEN;
+                g_ww_silence_start = 0;
+                if (g_ww_speech_seen && g_rec_bytes > 0) {
+                    play_ww_chime_end();
+                    g_rec_pending = true;
+                }
+            }
         } else {
-            // WW_LISTEN: drain mic DMA and feed to EI wake-word detector.
-            // During the post-detection cooldown, just drain the DMA without calling
-            // EI — this keeps the rolling window clean so detection always restarts
-            // from a fresh state rather than accumulating stale "Hey Mobi" features.
+            // WW_LISTEN: drain mic DMA and feed to MultiNet6 command recogniser.
+            // Looking for "HEY TALKIE" to start a recording session.
             echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
-            if (g_ww_enabled && !ww_in_cooldown() && ww_feed(s_stereo_chunk, REC_CHUNK_BYTES)) {
+            if (g_ww_enabled && cmd_feed(s_stereo_chunk, REC_CHUNK_BYTES) == CMD_HEY_TALKIE) {
                 play_ww_chime_start();
-                // Reset EI rolling window immediately so chime audio (which the
-                // mic picks up) cannot re-trigger detection when we return to LISTEN.
-                // This starts the 8 s cooldown from right now.
-                ww_reset();
                 // Drain DMA: flush ~300 ms of chime bleed-through from I2S RX buffers
                 for (int d = 0; d < 30; d++) echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
                 g_ww_state         = WW_RECORD;
