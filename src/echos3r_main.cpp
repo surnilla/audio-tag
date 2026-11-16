@@ -75,6 +75,7 @@ static volatile bool g_rec_pending = false;
 enum WwState { WW_LISTEN, WW_RECORD };
 static volatile WwState g_ww_state   = WW_LISTEN;
 static bool             g_ww_enabled = true;   // triple-tap G41 toggles on/off
+static int              g_ww_reply_cmd = CMD_NONE; // reply command detected during recording
 #define WW_SILENCE_THRESH      400   // int16 RMS below this = silence (during recording)
 #define WW_SILENCE_END_MS     1500   // 1.5 s of silence ends WW recording
 #define WW_MIN_RECORD_MS       600   // don't check silence until at least this long after start
@@ -681,8 +682,10 @@ void loop() {
             uint32_t elapsed = millis() - g_ww_record_start;
             int16_t rms = chunk_rms();
 
-            // Also run MultiNet on the recorded audio — if user says "OVER", end immediately
-            bool over_said = (g_ww_enabled && cmd_feed(s_stereo_chunk, REC_CHUNK_BYTES) == CMD_OVER);
+            // Also run MultiNet on the recorded audio — detect "OVER" and reply commands
+            int rec_cmd = g_ww_enabled ? cmd_feed(s_stereo_chunk, REC_CHUNK_BYTES) : CMD_NONE;
+            bool over_said = (rec_cmd == CMD_OVER);
+            if (cmd_is_reply(rec_cmd)) g_ww_reply_cmd = rec_cmd;
 
             bool silence_end = false;
             if (elapsed >= WW_MIN_RECORD_MS) {
@@ -700,9 +703,14 @@ void loop() {
             if (over_said || silence_end) {
                 g_ww_state         = WW_LISTEN;
                 g_ww_silence_start = 0;
-                // Send if any audio was captured — don't gate on speech energy,
-                // the user may have spoken quietly or the threshold may not be met.
-                if (g_rec_bytes > 0) {
+                if (g_ww_reply_cmd != CMD_NONE) {
+                    // Recognised a reply command — send text directly, skip Groq STT
+                    int reply_id   = g_ww_reply_cmd;
+                    g_ww_reply_cmd = CMD_NONE;
+                    g_rec_bytes    = 0;
+                    send_reply_text(reply_id);
+                } else if (g_rec_bytes > 0) {
+                    // Free-form speech — send audio to phone for Groq STT
                     play_ww_chime_end();
                     g_rec_pending = true;
                 }
@@ -722,6 +730,7 @@ void loop() {
                 g_ww_silence_start = 0;
                 g_ww_record_start  = millis();
                 g_rec_bytes        = 0;
+                g_ww_reply_cmd     = CMD_NONE;
                 notify_byte(STATUS_RECORDING);
             }
         }
