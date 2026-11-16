@@ -1,5 +1,6 @@
 // ESP-SR MultiNet6 English command recognition.
-// Recognises "HEY TALKIE" (CMD_HEY_TALKIE=1) and "OVER" (CMD_OVER=2).
+// Recognises "HEY TALKIE" (CMD_HEY_TALKIE=1), "OVER" (CMD_OVER=2),
+// and 25 worker reply phrases (CMD_COPY_THAT=3 … CMD_EVACUATE_AREA=27).
 // No separate wake word or AFE — MultiNet runs continuously on raw mic audio.
 //
 // Usage:
@@ -20,6 +21,42 @@ static model_iface_data_t *s_model    = nullptr;
 static int16_t            *s_buf      = nullptr;
 static int                 s_buf_idx  = 0;
 static int                 s_chunk    = 0;   // samples per detect() call (~480 = 30ms)
+
+// Map of command ID → display text
+static const struct { int id; const char *text; } s_cmd_text[] = {
+    { CMD_COPY_THAT,           "Copy that"           },
+    { CMD_THANK_YOU,           "Thank you"           },
+    { CMD_YES,                 "Yes"                 },
+    { CMD_NO,                  "No"                  },
+    { CMD_REPEAT_THAT,         "Repeat that"         },
+    { CMD_STAND_BY,            "Stand by"            },
+    { CMD_ON_MY_WAY,           "On my way"           },
+    { CMD_ALMOST_THERE,        "Almost there"        },
+    { CMD_IN_POSITION,         "In position"         },
+    { CMD_HEADING_BACK,        "Heading back"        },
+    { CMD_STAY_PUT,            "Stay put"            },
+    { CMD_MOVE_OUT,            "Move out"            },
+    { CMD_STARTING_NOW,        "Starting now"        },
+    { CMD_JOB_DONE,            "Job done"            },
+    { CMD_TAKING_BREAK,        "Taking break"        },
+    { CMD_GATE_OPEN,           "Gate open"           },
+    { CMD_GATE_CLOSED,         "Gate closed"         },
+    { CMD_ROAD_CLEAR,          "Road clear"          },
+    { CMD_ALL_CLEAR,           "All clear"           },
+    { CMD_NEED_HELP,           "Need help"           },
+    { CMD_SEND_BACKUP,         "Send backup"         },
+    { CMD_STOP_WORK,           "Stop work"           },
+    { CMD_DANGER_AHEAD,        "Danger ahead"        },
+    { CMD_VEHICLE_APPROACHING, "Vehicle approaching" },
+    { CMD_EVACUATE_AREA,       "Evacuate area"       },
+};
+
+const char *cmd_text(int id) {
+    for (auto &e : s_cmd_text) {
+        if (e.id == id) return e.text;
+    }
+    return nullptr;
+}
 
 bool cmd_init() {
     // Mount "model" partition (SPIFFS, contains srmodels.bin flashed by PlatformIO)
@@ -43,19 +80,44 @@ bool cmd_init() {
         return false;
     }
 
-    // 6000 ms inter-command timeout — MultiNet returns ESP_MN_STATE_TIMEOUT
-    // if no command is recognised within this window after the last detection.
+    // 6000 ms inter-command timeout
     s_model = s_multinet->create(mn_name, 6000);
     if (!s_model) {
         Serial.println("[CMD] model create failed");
         return false;
     }
 
-    // Register commands; command_id values map to CMD_HEY_TALKIE / CMD_OVER
+    // Register all commands
     esp_mn_commands_alloc(s_multinet, s_model);
     esp_mn_commands_clear();
-    esp_mn_commands_add(CMD_HEY_TALKIE, "HEY TALKIE");
-    esp_mn_commands_add(CMD_OVER, "OVER");
+    esp_mn_commands_add(CMD_HEY_TALKIE,          "HEY TALKIE");
+    esp_mn_commands_add(CMD_OVER,                "OVER");
+    esp_mn_commands_add(CMD_COPY_THAT,           "COPY THAT");
+    esp_mn_commands_add(CMD_THANK_YOU,           "THANK YOU");
+    esp_mn_commands_add(CMD_YES,                 "YES");
+    esp_mn_commands_add(CMD_NO,                  "NO");
+    esp_mn_commands_add(CMD_REPEAT_THAT,         "REPEAT THAT");
+    esp_mn_commands_add(CMD_STAND_BY,            "STAND BY");
+    esp_mn_commands_add(CMD_ON_MY_WAY,           "ON MY WAY");
+    esp_mn_commands_add(CMD_ALMOST_THERE,        "ALMOST THERE");
+    esp_mn_commands_add(CMD_IN_POSITION,         "IN POSITION");
+    esp_mn_commands_add(CMD_HEADING_BACK,        "HEADING BACK");
+    esp_mn_commands_add(CMD_STAY_PUT,            "STAY PUT");
+    esp_mn_commands_add(CMD_MOVE_OUT,            "MOVE OUT");
+    esp_mn_commands_add(CMD_STARTING_NOW,        "STARTING NOW");
+    esp_mn_commands_add(CMD_JOB_DONE,            "JOB DONE");
+    esp_mn_commands_add(CMD_TAKING_BREAK,        "TAKING BREAK");
+    esp_mn_commands_add(CMD_GATE_OPEN,           "GATE OPEN");
+    esp_mn_commands_add(CMD_GATE_CLOSED,         "GATE CLOSED");
+    esp_mn_commands_add(CMD_ROAD_CLEAR,          "ROAD CLEAR");
+    esp_mn_commands_add(CMD_ALL_CLEAR,           "ALL CLEAR");
+    esp_mn_commands_add(CMD_NEED_HELP,           "NEED HELP");
+    esp_mn_commands_add(CMD_SEND_BACKUP,         "SEND BACKUP");
+    esp_mn_commands_add(CMD_STOP_WORK,           "STOP WORK");
+    esp_mn_commands_add(CMD_DANGER_AHEAD,        "DANGER AHEAD");
+    esp_mn_commands_add(CMD_VEHICLE_APPROACHING, "VEHICLE APPROACHING");
+    esp_mn_commands_add(CMD_EVACUATE_AREA,       "EVACUATE AREA");
+
     esp_mn_error_t *err = esp_mn_commands_update();
     if (err && err->num > 0) {
         for (int i = 0; i < err->num; i++) {
@@ -69,7 +131,7 @@ bool cmd_init() {
     if (!s_buf) s_buf = (int16_t *)malloc(s_chunk * sizeof(int16_t));
     s_buf_idx = 0;
 
-    Serial.printf("[CMD] ready: chunk=%d samples, rate=%d Hz\n",
+    Serial.printf("[CMD] ready: chunk=%d samples, rate=%d Hz, commands=27\n",
                   s_chunk, s_multinet->get_samp_rate(s_model));
     return s_buf != nullptr;
 }
@@ -101,8 +163,9 @@ int cmd_feed(const uint8_t *stereo_chunk, int chunk_bytes) {
                 esp_mn_results_t *result = s_multinet->get_results(s_model);
                 if (result && result->num > 0) {
                     int id = result->command_id[0];
-                    Serial.printf("[CMD] detected id=%d prob=%.2f\n",
-                                  id, result->prob[0]);
+                    Serial.printf("[CMD] detected id=%d prob=%.2f text=%s\n",
+                                  id, result->prob[0],
+                                  cmd_text(id) ? cmd_text(id) : (id == CMD_HEY_TALKIE ? "HEY TALKIE" : "OVER"));
                     return id;
                 }
             }

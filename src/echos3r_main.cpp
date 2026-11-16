@@ -28,6 +28,7 @@
 #define STA_UUID   "12345678-1234-1234-1234-1234567890ae"  // notify: status
 #define MIC_UUID   "12345678-1234-1234-1234-1234567890af"  // notify: mic PCM → phone STT
 #define ALM_UUID   "12345678-1234-1234-1234-1234567890b0"  // write: trigger alarm playback
+#define RPL_UUID   "12345678-1234-1234-1234-1234567890b1"  // notify: worker reply text → phone
 
 // Status byte values
 #define STATUS_RECEIVING  0x01
@@ -48,6 +49,7 @@
 static M5EchoBase echo;
 static BLECharacteristic *g_sta_char = nullptr;
 static BLECharacteristic *g_mic_char = nullptr;
+static BLECharacteristic *g_rpl_char = nullptr;
 
 // --- Audio (raw PCM) path: phone → Echo ---
 static uint8_t  *g_audio_buf       = nullptr;
@@ -137,6 +139,15 @@ static void play_ww_chime_end() {
     play_beep(880, 100);   // A5
     delay(40);
     play_beep(587, 150);   // D5 — falling interval
+}
+
+static void send_reply_text(int cmd_id) {
+    const char *text = cmd_text(cmd_id);
+    if (!text || !g_rpl_char) return;
+    play_ww_chime_end();  // audio feedback so worker knows it was recognised
+    g_rpl_char->setValue((uint8_t *)text, strlen(text));
+    g_rpl_char->notify();
+    Serial.printf("[RPL] sent: %s\n", text);
 }
 
 static void notify_byte(uint8_t val) {
@@ -409,7 +420,7 @@ void setup() {
     );
     BLEServer  *srv = BLEDevice::createServer();
     srv->setCallbacks(new ServerCallbacks());
-    BLEService *svc = srv->createService(BLEUUID(SVC_UUID), 25);
+    BLEService *svc = srv->createService(BLEUUID(SVC_UUID), 30);
 
     BLECharacteristic *audio = svc->createCharacteristic(
         AUDIO_UUID, BLECharacteristic::PROPERTY_WRITE);
@@ -430,6 +441,10 @@ void setup() {
     g_mic_char = svc->createCharacteristic(
         MIC_UUID, BLECharacteristic::PROPERTY_NOTIFY);
     g_mic_char->addDescriptor(new BLE2902());
+
+    g_rpl_char = svc->createCharacteristic(
+        RPL_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    g_rpl_char->addDescriptor(new BLE2902());
 
     svc->start();
     BLEDevice::getAdvertising()->start();
@@ -696,7 +711,10 @@ void loop() {
             // WW_LISTEN: drain mic DMA and feed to MultiNet6 command recogniser.
             // Looking for "HEY TALKIE" to start a recording session.
             echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
-            if (g_ww_enabled && cmd_feed(s_stereo_chunk, REC_CHUNK_BYTES) == CMD_HEY_TALKIE) {
+            int ww_cmd = g_ww_enabled ? cmd_feed(s_stereo_chunk, REC_CHUNK_BYTES) : CMD_NONE;
+            if (cmd_is_reply(ww_cmd)) {
+                send_reply_text(ww_cmd);
+            } else if (ww_cmd == CMD_HEY_TALKIE) {
                 play_ww_chime_start();
                 // Drain DMA: flush ~300 ms of chime bleed-through from I2S RX buffers
                 for (int d = 0; d < 30; d++) echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
