@@ -720,9 +720,7 @@ void loop() {
             // Looking for "HEY TALKIE" to start a recording session.
             echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
             int ww_cmd = g_ww_enabled ? cmd_feed(s_stereo_chunk, REC_CHUNK_BYTES) : CMD_NONE;
-            if (cmd_is_reply(ww_cmd)) {
-                send_reply_text(ww_cmd);
-            } else if (ww_cmd == CMD_HEY_TALKIE) {
+            if (ww_cmd == CMD_HEY_TALKIE) {
                 play_ww_chime_start();
                 // Drain DMA: flush ~300 ms of chime bleed-through from I2S RX buffers
                 for (int d = 0; d < 30; d++) echo.record(s_stereo_chunk, REC_CHUNK_BYTES);
